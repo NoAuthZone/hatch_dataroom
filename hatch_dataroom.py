@@ -3,7 +3,7 @@
 hatch_dataroom - encrypted file exchange over HTTPS, Python standard library only.
 Runs on macOS, Windows and Linux.
 
-Version:  1.0.0
+Version:  1.1.0
 Project:  https://github.com/NoAuthZone/hatch_dataroom/
 
 Start:    python3 hatch_dataroom.py
@@ -93,6 +93,7 @@ CONN_OF = {}             # id(socket) -> ip (so a closed connection can be count
 RATE = {}                # ip -> [tokens, last refill time]
 LIMIT_SEEN = {}          # (kind, ip) -> last time a LIMIT line was logged
 CLOCK = threading.Lock()
+TLS_SEEN = {}            # ip -> last time a TLS_FAIL line was logged
 TOTAL_CONN_MAX = 200     # hard cap on simultaneous connections from everybody
 RATE_BURST = 100         # requests an IP may send in a burst before --rate applies
 
@@ -148,8 +149,10 @@ def _cert_openssl(ip):
         return False
     r = subprocess.run(
         [exe, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-         "-nodes", "-keyout", KEY, "-out", CERT, "-days", "3650", "-subj", "/CN=hatch_dataroom",
-         "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"],
+         "-nodes", "-keyout", KEY, "-out", CERT, "-days", "397", "-subj", "/CN=hatch_dataroom",
+         "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost",
+         "-addext", "extendedKeyUsage=serverAuth",
+         "-addext", "keyUsage=digitalSignature"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return r.returncode == 0 and os.path.exists(CERT) and os.path.exists(KEY)
 
@@ -159,7 +162,7 @@ def _cert_cryptography(ip):
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.x509.oid import NameOID
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
     except ImportError:
         print("openssl not found and 'cryptography' is not installed -> pip install cryptography")
         return False
@@ -173,8 +176,14 @@ def _cert_cryptography(ip):
     cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
             .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=3650))
-            .add_extension(san, critical=False).sign(key, hashes.SHA256()))
+            .not_valid_after(now + datetime.timedelta(days=397))
+            .add_extension(san, critical=False)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                                         key_encipherment=False, data_encipherment=False,
+                                         key_agreement=False, key_cert_sign=False, crl_sign=False,
+                                         encipher_only=False, decipher_only=False), critical=True)
+            .sign(key, hashes.SHA256()))
     with open(KEY, "wb") as f:
         f.write(key.private_bytes(serialization.Encoding.PEM,
                                   serialization.PrivateFormat.PKCS8,
@@ -187,7 +196,7 @@ def _cert_cryptography(ip):
 def ensure_cert(ip, force):
     if os.path.exists(CERT) and os.path.exists(KEY) and not force:
         return
-    print(f"Generating self-signed certificate for {ip} (10 years) ...")
+    print(f"Generating self-signed certificate for {ip} (397 days) ...")
     if not (_cert_openssl(ip) or _cert_cryptography(ip)):
         sys.exit("Could not generate a certificate.")
     try:
@@ -1311,7 +1320,12 @@ class TLSServer(ThreadingHTTPServer):
         return self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
     def handle_error(self, request, client_address):
-        pass  # don't print tracebacks for handshake errors / aborted connections
+        exc = sys.exc_info()[1]  # no tracebacks, but log TLS handshake failures
+        if isinstance(exc, ssl.SSLError):
+            ip, now = client_address[0], time.time()
+            if now - TLS_SEEN.get(ip, 0) > 10:
+                TLS_SEEN[ip] = now
+                audit(ip, "TLS_FAIL", getattr(exc, "reason", None) or str(exc))
 
 
 # ----------------------------------------------------------------------- main
