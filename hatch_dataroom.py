@@ -3,6 +3,9 @@
 hatch_dataroom - encrypted file exchange over HTTPS, Python standard library only.
 Runs on macOS, Windows and Linux.
 
+Version:  1.0.0
+Project:  https://github.com/NoAuthZone/hatch_dataroom/
+
 Start:    python3 hatch_dataroom.py
           A random password is generated and printed at startup.
 
@@ -62,6 +65,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "hatch_dataroom"
+__version__ = "1.0.0"
+REPO = "https://github.com/NoAuthZone/hatch_dataroom/"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "cert.pem")
 KEY = os.path.join(HERE, "key.pem")
@@ -402,6 +407,7 @@ tr:last-child td{border-bottom:0}tbody tr:hover{background:var(--panel2)}
 .r{text-align:right}.chk{width:2rem}.name{word-break:break-all}
 .hash{font:11.5px ui-monospace,Menlo,Consolas,monospace;color:var(--muted);cursor:copy;margin-top:3px;word-break:break-all;line-height:1.35}
 .hash:hover{color:var(--accent)}
+footer{margin-top:1.2rem;text-align:center;font-size:12px;color:var(--muted)}
 th.sortable{cursor:pointer;user-select:none;-webkit-user-select:none}th.sortable:hover{color:var(--text)}
 th .arr{display:inline-block;width:1em;color:var(--accent)}
 .size,.mod{white-space:nowrap;color:var(--muted)}.act{white-space:nowrap;text-align:right}.act>*{margin-left:.3rem}
@@ -442,6 +448,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div class="card"><table><thead><tr><th class="chk"><input type="checkbox" id="all" aria-label="select all"></th>
 <th class="sortable" data-sort="name" title="Sort by name">Name <span class="arr"></span></th><th class="r sortable" data-sort="size" title="Sort by size">Size <span class="arr"></span></th><th class="r mod sortable" data-sort="mtime" title="Sort by date">Modified <span class="arr"></span></th><th></th></tr></thead>
 <tbody>@@ROWS@@</tbody></table></div>
+<footer>hatch_dataroom v@@VER@@ &middot; <a href="@@REPO@@" target="_blank" rel="noopener noreferrer">@@REPO@@</a></footer>
 </div>
 <dialog id="dlg"><form method="dialog"><h3 id="dlg-title"></h3><p id="dlg-text"></p>
 <input id="dlg-input" autocomplete="off" spellcheck="false">
@@ -562,7 +569,8 @@ LOGIN = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div class="logo">@@LOGOL@@</div><div class="brand">hatch<b>_</b>dataroom</div>
 <input name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus>
 <button type="submit" class="primary">Unlock</button>
-<p class="err">@@MSG@@</p></form></body></html>"""
+<p class="err">@@MSG@@</p></form>
+<footer>hatch_dataroom v@@VER@@ &middot; <a href="@@REPO@@" target="_blank" rel="noopener noreferrer">@@REPO@@</a></footer></body></html>"""
 
 HTML = "text/html; charset=utf-8"
 
@@ -598,7 +606,7 @@ LOGO_ART = [r"     ________",
             r"   | .  ===   |",
             r"   | .  ====  |",
             r"   '----------'"]
-LOGO_TEXT = {1: "hatch_dataroom", 2: "encrypted file exchange"}
+LOGO_TEXT = {1: f"hatch_dataroom v{__version__}", 2: "encrypted file exchange", 3: REPO}
 
 
 def paint(code, text):
@@ -617,7 +625,7 @@ def print_logo():
 
 
 def render(template, **vals):
-    vals.update(CSS=CSS, FAVICON=FAVICON, LOGOS=logo_html(34), LOGOL=logo_html(72))
+    vals.update(VER=__version__, REPO=REPO, CSS=CSS, FAVICON=FAVICON, LOGOS=logo_html(34), LOGOL=logo_html(72))
     return re.sub(r"@@(\w+)@@", lambda m: vals.get(m.group(1), ""), template)
 
 
@@ -823,7 +831,7 @@ class ChunkedWriter:
 # -------------------------------------------------------------------- Handler
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "hatch_dataroom"
+    server_version = "hatch_dataroom"  # no version number in HTTP headers on purpose
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -1335,7 +1343,9 @@ def new_data_dir():
 
 
 def main():
-    ap = argparse.ArgumentParser(description=f"{APP} - encrypted file exchange (HTTPS + password)")
+    ap = argparse.ArgumentParser(description=f"{APP} v{__version__} - encrypted file exchange (HTTPS + password)",
+                                 epilog=f"Project: {REPO}")
+    ap.add_argument("--version", action="version", version=f"{APP} {__version__}  {REPO}")
     ap.add_argument("--dir", default=None,
                     help="data room folder (default: a new hatch-YYYYMMDD-HHMMSS folder for every start)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port (default {DEFAULT_PORT})")
