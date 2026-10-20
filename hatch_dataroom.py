@@ -3,7 +3,7 @@
 hatch_dataroom - encrypted file exchange over HTTPS, Python standard library only.
 Runs on macOS, Windows and Linux.
 
-Version:  1.1.0
+Version:  1.1.1
 Project:  https://github.com/NoAuthZone/hatch_dataroom/
 
 Start:    python3 hatch_dataroom.py
@@ -149,6 +149,7 @@ def _cert_openssl(ip):
         return False
     r = subprocess.run(
         [exe, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+         "-pkeyopt", "ec_param_enc:named_curve",  # some openssl/LibreSSL builds write explicit EC parameters, which browsers reject
          "-nodes", "-keyout", KEY, "-out", CERT, "-days", "397", "-subj", "/CN=hatch_dataroom",
          "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost",
          "-addext", "extendedKeyUsage=serverAuth",
