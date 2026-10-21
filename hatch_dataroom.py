@@ -3,7 +3,7 @@
 hatch_dataroom - encrypted file exchange over HTTPS, Python standard library only.
 Runs on macOS, Windows and Linux.
 
-Version:  1.2.0
+Version:  1.3.0
 Project:  https://github.com/NoAuthZone/hatch_dataroom/
 
 Start:    python3 hatch_dataroom.py
@@ -33,7 +33,9 @@ Options:  --dir FOLDER         Data room folder. Default: a new folder hatch-YYY
           --max-mb N           Maximum upload size in MB (default 2048)
           --session-hours N    Browser session lifetime in hours (default 8)
           --log FILE           Audit log (default: ./hatch.log), --no-log to disable
-          --no-qr              Do not print the QR code
+          --no-qr              Do not print the QR code. The QR code signs a phone in directly: it carries a
+                               one-time token (valid 30 minutes, usable once) in the URL fragment, so no
+                               password has to be typed. The password login keeps working.
           --new-cert           Regenerate the certificate (e.g. after an IP change)
 Password: generated at startup, or taken from TRANSFER_PASSWORD, or asked with --prompt.
 
@@ -71,7 +73,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "hatch_dataroom"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 REPO = "https://github.com/NoAuthZone/hatch_dataroom/"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "cert.pem")
@@ -84,6 +86,7 @@ MAX_FAILS, LOCK_SECONDS = 5, 60
 LOCK_MAX = 3600          # the lockout doubles with every repeated lockout (60s, 120s, 240s, ...) up to this
 LEVEL_DECAY = 3600       # seconds without failed logins until an address starts again at the first level
 DEFAULT_IDLE_MINUTES = 30
+QR_TOKEN_MINUTES = 30    # lifetime of the one-time sign-in token inside the QR code (it can be used only once)
 # Upload types refused by default (executables, scripts, installers, macro documents, shortcut/link files that can
 # trigger network connections when a folder is opened); change with --block-ext, turn off with --block-ext none
 DEFAULT_BLOCK_EXT = (
@@ -97,6 +100,8 @@ LOCAL_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
 CFG = {}                 # filled in main()
 FAILS = {}               # ip -> (failed attempts, locked until, lockout level, time of last failure)
 SESSIONS = {}            # session id -> expiry timestamp
+TOKENS = {}              # one-time QR sign-in tokens: token -> expiry timestamp
+TOKLOCK = threading.Lock()
 HASHES = {}              # (path, mtime_ns, size) -> sha256 hex
 STATE = {"last": time.time(), "active": 0, "transfers": 0}
 SLOCK = threading.Lock()
@@ -482,6 +487,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script>
 const $=s=>document.querySelector(s);
 const dir=document.body.dataset.dir;
+if(location.hash.indexOf('#t=')===0){try{history.replaceState(null,'',location.pathname+location.search);}catch(e){}}  // never keep a QR token in the address bar
 let tt;
 function toast(m,bad){const t=$('#toast');t.textContent=m;t.className='show'+(bad?' bad':'');clearTimeout(tt);tt=setTimeout(()=>{t.className='';},3500);}
 function ask(title,text,opts){opts=opts||{};return new Promise(res=>{
@@ -595,7 +601,26 @@ LOGIN = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <input name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus>
 <button type="submit" class="primary">Unlock</button>
 <p class="err">@@MSG@@</p></form>
-<footer>hatch_dataroom v@@VER@@ &middot; <a href="@@REPO@@" target="_blank" rel="noopener noreferrer">@@REPO@@</a></footer></body></html>"""
+<footer>hatch_dataroom v@@VER@@ &middot; <a href="@@REPO@@" target="_blank" rel="noopener noreferrer">@@REPO@@</a></footer>
+<script>
+(function(){
+  // QR code sign-in: the one-time token travels in the URL fragment (#t=...), which the browser never sends
+  // to the server. Remove it from the address bar at once, then exchange it for a session.
+  var m=/^#t=([A-Za-z0-9_-]{16,128})$/.exec(location.hash);
+  if(!m)return;
+  try{history.replaceState(null,'',location.pathname+location.search);}catch(e){}
+  var err=document.querySelector('.err');
+  err.textContent='Signing in with QR code ...';
+  fetch('/__token',{method:'POST',headers:{'X-Requested-With':'hatch','Content-Type':'application/json'},
+    body:JSON.stringify({t:m[1]})})
+    .then(function(r){
+      if(r.ok){location.replace('/');return;}
+      err.textContent=r.status===429?'Too many failed attempts, try again later.'
+        :'QR code expired or already used. Enter the password.';
+    })
+    .catch(function(){err.textContent='Network error. Enter the password.';});
+})();
+</script></body></html>"""
 
 HTML = "text/html; charset=utf-8"
 
@@ -664,6 +689,30 @@ def human(n):
 # -------------------------------------------------------------------- Helpers
 def password_ok(pw):
     return hmac.compare_digest(hashlib.sha256(pw.encode()).digest(), CFG["pwhash"])
+
+
+def new_qr_token():
+    """Create the one-time sign-in token for the QR code (replaces any earlier one)."""
+    token = secrets.token_urlsafe(24)
+    with TOKLOCK:
+        TOKENS.clear()
+        TOKENS[token] = time.time() + QR_TOKEN_MINUTES * 60
+    return token
+
+
+def redeem_token(candidate):
+    """True exactly once for a valid, unexpired token: it is removed on the first successful use.
+    Expired tokens are dropped; comparison is constant-time."""
+    now = time.time()
+    ok = False
+    with TOKLOCK:
+        for token, expires in list(TOKENS.items()):
+            if expires <= now:
+                TOKENS.pop(token, None)
+            elif hmac.compare_digest(token.encode(), candidate.encode("utf-8", "replace")):
+                TOKENS.pop(token, None)
+                ok = True
+    return ok
 
 
 def valid_name(n):
@@ -1000,16 +1049,49 @@ class Handler(BaseHTTPRequestHandler):
         data = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         if password_ok(data.get("password", [""])[0]):
             FAILS.pop(ip, None)
-            now = time.time()
-            for k in [k for k, v in SESSIONS.items() if v <= now]:
-                SESSIONS.pop(k, None)
-            sid = secrets.token_urlsafe(32)
-            SESSIONS[sid] = now + CFG["session_seconds"]
+            sid = self.open_session()
             audit(ip, "LOGIN_OK")
             return self.reply(303, extra={"Location": "/",
                                           "Set-Cookie": self.cookie_header(sid, CFG["session_seconds"])})
         self.fail(ip)
         self.reply(401, render(LOGIN, MSG="Wrong password."), HTML)
+
+    @staticmethod
+    def open_session():
+        """Create a browser session (and drop expired ones); returns the session id."""
+        now = time.time()
+        for k in [k for k, v in SESSIONS.items() if v <= now]:
+            SESSIONS.pop(k, None)
+        sid = secrets.token_urlsafe(32)
+        SESSIONS[sid] = now + CFG["session_seconds"]
+        return sid
+
+    def token_login(self):
+        """Sign-in with the one-time token from the QR code (sent by the login page's script)."""
+        ip = self.client_address[0]
+        if self.locked(ip):
+            return self.reply(429, "Too many failed attempts, try again later.\n", close=True)
+        if self.headers.get("X-Requested-With") != "hatch":
+            return self.reply(403, "Forbidden.\n", close=True)
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = 0
+        if not 0 < length <= 512:
+            return self.reply(400, "Bad request.\n", close=True)
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            token = data.get("t") if isinstance(data, dict) else None
+        except Exception:
+            return self.json(400, {"error": "Bad request"}, close=True)
+        if isinstance(token, str) and redeem_token(token):
+            FAILS.pop(ip, None)
+            sid = self.open_session()
+            audit(ip, "LOGIN_OK", "QR code (one-time token used)")
+            return self.reply(200, '{"ok":true}', "application/json",
+                              extra={"Set-Cookie": self.cookie_header(sid, CFG["session_seconds"])})
+        self.fail(ip)  # wrong, expired and already used tokens count like wrong passwords
+        self.json(401, {"error": "Invalid, expired or already used token"}, close=True)
 
     def logout(self):
         sid = self.session_id()
@@ -1264,6 +1346,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path == "/__login":
             return self.login()
+        if path == "/__token":
+            return self.token_login()
         if path == "/__logout":
             return self.logout()
         if path.startswith("/__api/"):
@@ -1603,12 +1687,19 @@ def main():
     extras.append(f"log {CFG['log']}" if CFG["log"] else "log off")
     print("Options:  " + "; ".join(extras))
     if not a.no_qr and sys.stdout.isatty():
-        qr = qr_ansi(url)
+        token = new_qr_token()  # the QR code itself signs the phone in: one-time, valid QR_TOKEN_MINUTES
+        qr = qr_ansi(url + "#t=" + token)
+        shown = False
         if qr:
             try:
-                print(f"\nScan to open on your phone:\n{qr}")
+                print(f"\nScan to sign in on your phone (one-time, valid {QR_TOKEN_MINUTES} min; "
+                      f"the password still works):\n{qr}")
+                shown = True
             except UnicodeEncodeError:
                 pass
+        if not shown:
+            with TOKLOCK:
+                TOKENS.clear()  # the QR code was not displayed, so no token should stay valid
     print("\nStop with Ctrl+C\n", flush=True)
     audit("-", "START", f"{url} dir={CFG['root']} access={mode}", console=False)
 
