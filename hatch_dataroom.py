@@ -3,7 +3,7 @@
 hatch_dataroom - encrypted file exchange over HTTPS, Python standard library only.
 Runs on macOS, Windows and Linux.
 
-Version:  1.1.1
+Version:  1.2.0
 Project:  https://github.com/NoAuthZone/hatch_dataroom/
 
 Start:    python3 hatch_dataroom.py
@@ -17,7 +17,13 @@ Options:  --dir FOLDER         Data room folder. Default: a new folder hatch-YYY
                                (repeatable or comma separated; this machine is always allowed).
                                Default: local network only (private ranges, see LOCAL_NETS).
                                Use --allow any to accept every address.
-          --idle-minutes N     Stop automatically after N minutes without activity
+                               Without --allow, an interactive start asks for the other machine's IP
+                               (Enter = whole local network); --no-ask skips that question.
+          --no-ask             Do not ask for the client IP at startup
+          --tls12              Also allow TLS 1.2 (default: TLS 1.3 only, if this Python supports it)
+          --on-conflict MODE   Upload to an existing name: rename (default, "name (2).ext"),
+                               fail (HTTP 409) or overwrite
+          --idle-minutes N     Stop automatically after N minutes without activity (default 30, 0 = off)
           --once               Stop after the first completed transfer (once things go quiet)
           --read-only          Downloads only: no upload, rename, delete or new folder
           --block-ext LIST     Refuse these upload types (default: exe,msi,bat,cmd,ps1,...; 'none' = off)
@@ -65,7 +71,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "hatch_dataroom"
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 REPO = "https://github.com/NoAuthZone/hatch_dataroom/"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "cert.pem")
@@ -75,13 +81,21 @@ CHUNK = 1024 * 1024
 DEFAULT_PORT = 9001
 ONCE_GRACE = 10          # seconds of quiet after the first transfer before --once stops the server
 MAX_FAILS, LOCK_SECONDS = 5, 60
-# Upload types refused by default (Windows executables/scripts); change with --block-ext, turn off with --block-ext none
-DEFAULT_BLOCK_EXT = "exe,msi,bat,cmd,com,scr,pif,ps1,vbs,vbe,wsf,hta,jar,dll,lnk"
+LOCK_MAX = 3600          # the lockout doubles with every repeated lockout (60s, 120s, 240s, ...) up to this
+LEVEL_DECAY = 3600       # seconds without failed logins until an address starts again at the first level
+DEFAULT_IDLE_MINUTES = 30
+# Upload types refused by default (executables, scripts, installers, macro documents, shortcut/link files that can
+# trigger network connections when a folder is opened); change with --block-ext, turn off with --block-ext none
+DEFAULT_BLOCK_EXT = (
+    "exe,msi,msp,mst,bat,cmd,com,scr,pif,cpl,msc,gadget,"
+    "ps1,psm1,psd1,ps1xml,vbs,vbe,js,jse,wsf,wsh,wsc,sct,hta,jar,jnlp,dll,inf,reg,"
+    "lnk,url,scf,library-ms,searchconnector-ms,chm,msix,msixbundle,appx,appxbundle,iso,"
+    "docm,dotm,xlsm,xlam,pptm,sh,bash,command,app,dmg,pkg")
 # "Local network": private address ranges (RFC 1918), link-local, and IPv6 unique-local/link-local.
 LOCAL_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"]
 
 CFG = {}                 # filled in main()
-FAILS = {}               # ip -> (failed attempts, locked until)
+FAILS = {}               # ip -> (failed attempts, locked until, lockout level, time of last failure)
 SESSIONS = {}            # session id -> expiry timestamp
 HASHES = {}              # (path, mtime_ns, size) -> sha256 hex
 STATE = {"last": time.time(), "active": 0, "transfers": 0}
@@ -543,7 +557,8 @@ async function upload(items){
     if(x&&x.status===401){location.reload();return;}
     if(x&&x.status===201){
       ui.p.value=100;ui.d.classList.add('ok');
-      ui.s.textContent=it.rel+'  sha256 '+(x.getResponseHeader('X-SHA256')||'').slice(0,16)+'...';
+      const sa=x.getResponseHeader('X-Saved-As');
+      ui.s.textContent=(sa?it.rel+' -> saved as '+decodeURIComponent(sa)+' (name existed)':it.rel)+'  sha256 '+(x.getResponseHeader('X-SHA256')||'').slice(0,16)+'...';
     }else{
       bad++;ui.d.classList.add('bad');ui.s.textContent=it.rel+'  failed ('+(x?x.status:'network')+')';
     }
@@ -848,20 +863,32 @@ class Handler(BaseHTTPRequestHandler):
         pass  # we write our own audit log
 
     # -- responses
+    def security_headers(self, page=True):
+        """Security headers for every response; downloads (page=False) get a sandboxed, script-less CSP."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Permissions-Policy",
+                         "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), "
+                         "payment=(), usb=(), interest-cohort=()")
+        if page:
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                             "img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+        else:
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox; frame-ancestors 'none'")
+
     def reply(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None, close=False):
         if isinstance(body, str):
             body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Strict-Transport-Security", "max-age=31536000")
-        self.send_header("Content-Security-Policy",
-                         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                         "img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+        self.security_headers()
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         if close:
@@ -876,18 +903,30 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- brute-force protection
     def locked(self, ip):
-        _, until = FAILS.get(ip, (0, 0))
-        if until and until <= time.time():
-            FAILS.pop(ip, None)
+        rec = FAILS.get(ip)
+        if not rec:
             return False
-        return until > time.time()
+        fails, until, level, last = rec
+        now = time.time()
+        if until > now:
+            return True
+        if now - last > LEVEL_DECAY:  # quiet for long enough: forget this address
+            FAILS.pop(ip, None)
+        elif until:                   # lockout over: count attempts again, but keep the escalation level
+            FAILS[ip] = (0, 0, level, last)
+        return False
 
     def fail(self, ip):
-        fails, _ = FAILS.get(ip, (0, 0))
+        fails, _, level, _ = FAILS.get(ip, (0, 0, 0, 0))
+        now = time.time()
         fails += 1
-        locked = fails >= MAX_FAILS
-        FAILS[ip] = (fails, time.time() + LOCK_SECONDS if locked else 0)
-        audit(ip, "LOCKED" if locked else "LOGIN_FAIL", f"{LOCK_SECONDS}s lockout" if locked else "")
+        if fails >= MAX_FAILS:
+            secs = min(LOCK_SECONDS * 2 ** level, LOCK_MAX)  # 60s, 120s, 240s, ... up to LOCK_MAX
+            FAILS[ip] = (0, now + secs, level + 1, now)
+            audit(ip, "LOCKED", f"{secs}s lockout")
+        else:
+            FAILS[ip] = (fails, 0, level, now)
+            audit(ip, "LOGIN_FAIL", "")
         time.sleep(1)
 
     # -- sessions
@@ -1036,7 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         self.send_header("Content-Disposition",
                          "attachment; filename*=UTF-8''" + urllib.parse.quote(os.path.basename(full)))
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self.security_headers(page=False)
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -1121,8 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(zipname))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
+        self.security_headers(page=False)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         if self.command == "HEAD":
@@ -1167,6 +1205,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(411, "Content-Length required.\n", close=True)
         if length < 0 or length > CFG["max_bytes"]:
             return self.reply(413, "File too large.\n", close=True)
+        renamed_from = None
+        if os.path.lexists(full):  # never replace an existing file silently
+            mode = CFG.get("on_conflict", "rename")
+            if mode == "fail":
+                audit(self.client_address[0], "EXISTS", f"upload {self.rel(full)} refused (file exists)")
+                return self.reply(409, "A file with that name already exists.\n", close=True)
+            if mode == "rename":
+                stem, ext = os.path.splitext(os.path.basename(full))
+                n = 2
+                while True:
+                    cand = os.path.join(os.path.dirname(full), f"{stem} ({n}){ext}")
+                    if not os.path.lexists(cand):
+                        break
+                    n += 1
+                renamed_from = self.rel(full)
+                full = cand
         parent = os.path.dirname(full)
         os.makedirs(parent, exist_ok=True)
         tmp = os.path.join(parent, TMP_PREFIX + secrets.token_hex(6))
@@ -1194,9 +1248,15 @@ class Handler(BaseHTTPRequestHandler):
             HASHES[(full, st.st_mtime_ns, st.st_size)] = hexd
         except OSError:
             pass
-        audit(self.client_address[0], "UPLOAD", f"{self.rel(full)} {got} bytes sha256={hexd}")
+        note = f" (name existed, was {renamed_from})" if renamed_from else ""
+        audit(self.client_address[0], "UPLOAD", f"{self.rel(full)} {got} bytes sha256={hexd}{note}")
         transfer_done()
-        self.reply(201, f"Saved ({human(got)}) sha256:{hexd}\n", extra={"X-SHA256": hexd})
+        extra = {"X-SHA256": hexd}
+        msg = f"Saved ({human(got)}) sha256:{hexd}\n"
+        if renamed_from:
+            extra["X-Saved-As"] = urllib.parse.quote(os.path.basename(full))
+            msg = f"Saved as {os.path.basename(full)} because {renamed_from} already exists ({human(got)}) sha256:{hexd}\n"
+        self.reply(201, msg, extra=extra)
 
     # -- POST (login, logout, file operations)
     @tracked
@@ -1347,6 +1407,34 @@ def parse_allow(values):
     return nets or None
 
 
+def ask_peer():
+    """Interactive start: limit access to the other machine. Enter = the whole local network (None)."""
+    while True:
+        try:
+            text = input("IP of the other machine (several separated by commas, Enter = whole local network): ")
+        except EOFError:
+            return None
+        except KeyboardInterrupt:
+            print()
+            sys.exit(1)
+        nets, bad = [], None
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.lower() in ("any", "all", "*"):
+                return []
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                bad = part
+                break
+        if bad:
+            print(f"  '{bad}' is not a valid IP address or network, try again.")
+            continue
+        return nets or None
+
+
 def new_data_dir():
     """hatch-YYYYMMDD-HHMMSS next to this script (numbered if it already exists)."""
     base = os.path.join(HERE, datetime.datetime.now().strftime("hatch-%Y%m%d-%H%M%S"))
@@ -1368,7 +1456,15 @@ def main():
     ap.add_argument("--allow", action="append", metavar="NET",
                     help="only accept clients from this IP/subnet (repeatable, comma separated); "
                          "default: local network only; 'any' = everyone")
-    ap.add_argument("--idle-minutes", type=float, default=0, help="stop after N minutes without activity")
+    ap.add_argument("--no-ask", action="store_true",
+                    help="do not ask for the other machine's IP at an interactive start")
+    ap.add_argument("--tls12", action="store_true",
+                    help="also allow TLS 1.2 (default: TLS 1.3 only when this Python supports it)")
+    ap.add_argument("--on-conflict", choices=("rename", "fail", "overwrite"), default="rename",
+                    help="upload to an existing file name: rename = keep both as 'name (2).ext' (default), "
+                         "fail = refuse (HTTP 409), overwrite = replace the old file")
+    ap.add_argument("--idle-minutes", type=float, default=DEFAULT_IDLE_MINUTES,
+                    help=f"stop after N minutes without activity (default {DEFAULT_IDLE_MINUTES}, 0 = never)")
     ap.add_argument("--once", action="store_true", help="stop after the first completed transfer")
     ap.add_argument("--prompt", action="store_true", help="ask for the password instead of generating one")
     ap.add_argument("--max-mb", type=int, default=2048, help="maximum upload size in MB")
@@ -1405,6 +1501,8 @@ def main():
     os.makedirs(data_dir, exist_ok=True)
 
     allow_arg = parse_allow(a.allow)
+    if allow_arg is None and not a.no_ask and sys.stdin.isatty() and sys.stdout.isatty():
+        allow_arg = ask_peer()
     if allow_arg is None:
         allow, mode = default_allow(ip), "local"
     elif not allow_arg:
@@ -1417,7 +1515,7 @@ def main():
                allow=allow, idle_seconds=int(a.idle_minutes * 60), once=a.once,
                log=None if a.no_log else os.path.abspath(a.log),
                read_only=a.read_only, block_ext=parse_ext(a.block_ext if a.block_ext is not None else [DEFAULT_BLOCK_EXT]),
-               max_conn=max(0, a.max_conn), rate=max(0.0, a.rate))
+               max_conn=max(0, a.max_conn), rate=max(0.0, a.rate), on_conflict=a.on_conflict)
 
     # The private key, certificate and log must never sit inside the shared folder.
     for what, path in (("private key", KEY), ("certificate", CERT), ("audit log", CFG["log"])):
@@ -1431,7 +1529,16 @@ def main():
 
     ensure_cert(ip, a.new_cert)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if a.tls12 or not ssl.HAS_TLSv1_3:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")  # TLS 1.2 suites: forward secrecy + AEAD only
+        except ssl.SSLError:
+            pass
+        tls_text = "TLS 1.2+" if a.tls12 else "TLS 1.2+ (this Python/OpenSSL has no TLS 1.3)"
+    else:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        tls_text = "TLS 1.3 only (--tls12 also allows TLS 1.2)"
     ctx.load_cert_chain(CERT, KEY)
 
     TLSServer.ssl_context = ctx
@@ -1469,15 +1576,23 @@ def main():
         pass
     print(f"SHA-256:  {fingerprint()}")
     print("          (compare it with the browser warning, don't just click through)")
-    extras = []
+    extras = [tls_text]
     if CFG["idle_seconds"]:
         extras.append(f"stops after {a.idle_minutes:g} min idle")
+    else:
+        extras.append("no idle timeout (--idle-minutes 0)")
+    extras.append({"rename": "existing names are kept (new upload becomes 'name (2).ext')",
+                   "fail": "existing names are refused (HTTP 409)",
+                   "overwrite": "uploads OVERWRITE existing files"}[CFG["on_conflict"]])
     if a.once:
         extras.append("stops after the first transfer")
     if a.read_only:
         extras.append("READ-ONLY (downloads only)")
     if CFG["block_ext"]:
-        extras.append("blocked upload types: " + ", ".join("." + e for e in sorted(CFG["block_ext"])))
+        exts = sorted(CFG["block_ext"])
+        extras.append("blocked upload types: " + (", ".join("." + e for e in exts) if len(exts) <= 12 else
+                      f"{len(exts)} types (.exe, .ps1, .js, .lnk, .iso, macro documents, ...; "
+                      f"change with --block-ext, 'none' = off)"))
     lim = []
     if CFG["max_conn"]:
         lim.append(f"{CFG['max_conn']} connections")
