@@ -3,7 +3,7 @@
 hatch_dataroom - encrypted file exchange over HTTPS, Python standard library only.
 Runs on macOS, Windows and Linux.
 
-Version:  1.3.0
+Version:  1.4.0
 Project:  https://github.com/NoAuthZone/hatch_dataroom/
 
 Start:    python3 hatch_dataroom.py
@@ -44,6 +44,9 @@ Usage:
   Upload:   curl --cacert cert.pem -u :PW -T file.zip https://IP:9001/file.zip
   Download: curl --cacert cert.pem -u :PW -O https://IP:9001/file.zip
   Checksum: curl --cacert cert.pem -u :PW "https://IP:9001/file.zip?sha256"
+  Encrypted ZIP (AES-256, open with 7-Zip, Keka, WinZip ...): in the browser use "encrypted ZIP"; with curl
+            curl --cacert cert.pem -u :PW --data-urlencode password=ZIPPW -d path=/ -d zip=a.txt -d zip=sub \
+                 https://IP:9001/__zip -o files.zip     (omit zip= to pack the whole folder; ZIPPW: 8+ characters)
 There is no user name; with curl leave it empty (-u :PW). Any name sent is ignored.
 """
 import argparse
@@ -63,17 +66,19 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 import zipfile
+import zlib
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "hatch_dataroom"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 REPO = "https://github.com/NoAuthZone/hatch_dataroom/"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "cert.pem")
@@ -473,6 +478,8 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <button type="button" data-act="mkdir">New folder</button>
 <button type="button" data-act="zip-selected">Download selected as ZIP</button>
 <a class="btn" href="?zip">This folder as ZIP</a>
+<button type="button" data-act="zip-selected-enc">Selected as encrypted ZIP</button>
+<button type="button" data-act="zip-folder-enc">This folder as encrypted ZIP</button>
 </div>
 <div class="card"><table><thead><tr><th class="chk"><input type="checkbox" id="all" aria-label="select all"></th>
 <th class="sortable" data-sort="name" title="Sort by name">Name <span class="arr"></span></th><th class="r sortable" data-sort="size" title="Sort by size">Size <span class="arr"></span></th><th class="r mod sortable" data-sort="mtime" title="Sort by date">Modified <span class="arr"></span></th><th></th></tr></thead>
@@ -499,6 +506,13 @@ function ask(title,text,opts){opts=opts||{};return new Promise(res=>{
   d.onclose=()=>res(d.returnValue==='ok'?(inp.hidden?true:inp.value.trim()):null);
   d.showModal();if(!inp.hidden){inp.focus();inp.select();}
 });}
+function genPw(){try{const a='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_',r=new Uint8Array(20);crypto.getRandomValues(r);return [...r].map(x=>a[x&63]).join('');}catch(e){return '';}}
+function postZip(names,pw){
+  const f=document.createElement('form');f.method='POST';f.action='/__zip';f.style.display='none';
+  const add=(k,v)=>{const i=document.createElement('input');i.type='hidden';i.name=k;i.value=v;f.appendChild(i);};
+  add('path',dir);add('password',pw);names.forEach(n=>add('zip',n));
+  document.body.appendChild(f);f.submit();f.remove();
+}
 async function api(action,body){
   let r;
   try{r=await fetch('/__api/'+action,{method:'POST',headers:{'X-Requested-With':'hatch','Content-Type':'application/json'},body:JSON.stringify(body)});}
@@ -520,6 +534,17 @@ document.addEventListener('click',async e=>{
   }else if(act==='mkdir'){
     const n=await ask('New folder','Name of the new folder',{input:'',ok:'Create'});
     if(n&&await api('mkdir',{path:dir,name:n}))location.reload();
+  }else if(act==='zip-selected-enc'||act==='zip-folder-enc'){
+    let names=[];
+    if(act==='zip-selected-enc'){
+      names=[...document.querySelectorAll('.sel:checked')].map(c=>c.closest('tr').dataset.name);
+      if(!names.length){toast('Select files first',true);return;}
+    }
+    const pw=await ask('Encrypted ZIP','AES-256. Copy this password now, it is not stored (or type your own, 8+ characters). Open the ZIP with 7-Zip, Keka or WinZip.',{input:genPw(),ok:'Download'});
+    if(pw===null)return;
+    if(pw.length<8||pw.length>128){toast('The ZIP password needs 8 to 128 characters',true);return;}
+    postZip(names,pw);
+    toast('Preparing the encrypted ZIP ...');
   }else if(act==='zip-selected'){
     const names=[...document.querySelectorAll('.sel:checked')].map(c=>c.closest('tr').dataset.name);
     if(!names.length){toast('Select files first',true);return;}
@@ -880,6 +905,200 @@ def watchdog(srv):
         return
 
 
+# ------------------------------------------------- encrypted ZIP (WinZip AES-256, "AE-2")
+# Standard library only. AES itself is not in the standard library, so a small pure-Python AES-256 (encryption
+# direction only, which is all CTR mode needs) is included. If the optional "cryptography" package happens to be
+# installed it is used instead because it is much faster; the ZIP bytes are identical either way.
+try:  # optional speed-up, never required
+    from cryptography.hazmat.primitives.ciphers import Cipher as _Cipher, algorithms as _algs, modes as _modes
+except Exception:  # pragma: no cover
+    _Cipher = None
+
+
+def _build_aes_tables():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = (p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)) & 0xFF   # p *= 3
+        q ^= (q << 1) & 0xFF                                              # q /= 3
+        q ^= (q << 2) & 0xFF
+        q ^= (q << 4) & 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        rot = lambda v, n: ((v << n) | (v >> (8 - n))) & 0xFF
+        sbox[p] = q ^ rot(q, 1) ^ rot(q, 2) ^ rot(q, 3) ^ rot(q, 4) ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    xt = lambda v: ((v << 1) ^ 0x1B) & 0xFF if v & 0x80 else v << 1
+    te0 = [(xt(s) << 24) | (s << 16) | (s << 8) | (xt(s) ^ s) for s in sbox]
+    ror8 = lambda w: ((w >> 8) | (w << 24)) & 0xFFFFFFFF
+    te1 = [ror8(w) for w in te0]
+    te2 = [ror8(w) for w in te1]
+    te3 = [ror8(w) for w in te2]
+    return sbox, te0, te1, te2, te3
+
+
+_SBOX, _TE0, _TE1, _TE2, _TE3 = _build_aes_tables()
+
+
+def _aes256_round_keys(key):
+    """Key schedule for AES-256: 60 32-bit words."""
+    w = list(struct.unpack(">8I", key))
+    sub = lambda t: (_SBOX[t >> 24] << 24) | (_SBOX[(t >> 16) & 255] << 16) | (_SBOX[(t >> 8) & 255] << 8) | _SBOX[t & 255]
+    rcon = 1
+    for i in range(8, 60):
+        t = w[i - 1]
+        if i % 8 == 0:
+            t = sub(((t << 8) | (t >> 24)) & 0xFFFFFFFF) ^ (rcon << 24)
+            rcon = ((rcon << 1) ^ 0x1B) & 0xFF if rcon & 0x80 else rcon << 1
+        elif i % 8 == 4:
+            t = sub(t)
+        w.append(w[i - 8] ^ t)
+    return w
+
+
+def _aes256_encrypt_blocks(rk, blocks):
+    """ECB-encrypt a bytes object made of 16-byte blocks (pure Python)."""
+    te0, te1, te2, te3, sb = _TE0, _TE1, _TE2, _TE3, _SBOX
+    words = struct.unpack(">%dI" % (len(blocks) // 4), blocks)
+    out = []
+    k0, k1, k2, k3 = rk[0:4]
+    for i in range(0, len(words), 4):
+        s0, s1, s2, s3 = words[i] ^ k0, words[i + 1] ^ k1, words[i + 2] ^ k2, words[i + 3] ^ k3
+        for r in range(4, 56, 4):
+            t0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 255] ^ te2[(s2 >> 8) & 255] ^ te3[s3 & 255] ^ rk[r]
+            t1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 255] ^ te2[(s3 >> 8) & 255] ^ te3[s0 & 255] ^ rk[r + 1]
+            t2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 255] ^ te2[(s0 >> 8) & 255] ^ te3[s1 & 255] ^ rk[r + 2]
+            t3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 255] ^ te2[(s1 >> 8) & 255] ^ te3[s2 & 255] ^ rk[r + 3]
+            s0, s1, s2, s3 = t0, t1, t2, t3
+        out.append(((sb[s0 >> 24] << 24) | (sb[(s1 >> 16) & 255] << 16) | (sb[(s2 >> 8) & 255] << 8) | sb[s3 & 255]) ^ rk[56])
+        out.append(((sb[s1 >> 24] << 24) | (sb[(s2 >> 16) & 255] << 16) | (sb[(s3 >> 8) & 255] << 8) | sb[s0 & 255]) ^ rk[57])
+        out.append(((sb[s2 >> 24] << 24) | (sb[(s3 >> 16) & 255] << 16) | (sb[(s0 >> 8) & 255] << 8) | sb[s1 & 255]) ^ rk[58])
+        out.append(((sb[s3 >> 24] << 24) | (sb[(s0 >> 16) & 255] << 16) | (sb[(s1 >> 8) & 255] << 8) | sb[s2 & 255]) ^ rk[59])
+    return struct.pack(">%dI" % len(out), *out)
+
+
+class AesCtr:
+    """AES-256 in the CTR variant WinZip uses: 128-bit little-endian counter starting at 1."""
+
+    def __init__(self, key, fast=True):
+        self.counter, self.ks = 1, b""
+        if fast and _Cipher is not None:
+            self.enc = _Cipher(_algs.AES(key), _modes.ECB()).encryptor()
+            self.ecb = self.enc.update
+        else:
+            rk = _aes256_round_keys(key)
+            self.ecb = lambda blocks: _aes256_encrypt_blocks(rk, blocks)
+
+    def process(self, data):
+        n = len(data)
+        if n > len(self.ks):
+            nb = (n - len(self.ks) + 15) // 16
+            ctr = struct.pack("<%dQ" % (2 * nb), *[v for c in range(self.counter, self.counter + nb) for v in (c, 0)])
+            self.counter += nb
+            self.ks += self.ecb(ctr)
+        ks, self.ks = self.ks[:n], self.ks[n:]
+        return (int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")).to_bytes(n, "big") if n else b""
+
+
+ZIP64_FILE = 0x7FFFFFFF  # files from this size on get ZIP64 headers (same threshold as Python's zipfile)
+ZIP_PW_MIN, ZIP_PW_MAX = 8, 128
+
+
+def _dos_time(mtime):
+    t = time.localtime(max(mtime, 315532800))  # DOS time cannot go before 1980
+    return (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2), (min(t.tm_year - 1980, 127) << 9) | (t.tm_mon << 5) | t.tm_mday
+
+
+class AesZipWriter:
+    """Streaming ZIP writer: every file is deflated, then AES-256 encrypted with HMAC-SHA1 authentication
+    (WinZip AE-2, readable by 7-Zip, Keka, WinZip, Info-ZIP 6.1+ and others). Names stay readable; contents are
+    encrypted. The output only needs a write() method, so it can be streamed to the browser."""
+
+    def __init__(self, out, password):
+        self.out, self.pw, self.pos, self.cd = out, password.encode("utf-8"), 0, []
+        self.fast = True  # tests can switch this off to force the pure-Python AES
+
+    def _w(self, data):
+        self.out.write(data)
+        self.pos += len(data)
+
+    def _add_plain(self, name, mtime, attr):
+        """Entry without data (folder or empty file): stored, nothing to encrypt."""
+        dt, dd = _dos_time(mtime)
+        off = self.pos
+        self._w(struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0x0800, 0, dt, dd, 0, 0, 0, len(name), 0) + name)
+        self.cd.append((name, 0x0800, 0, dt, dd, 0, 0, off, attr, False))
+
+    def add_dir(self, arc, mtime):
+        self._add_plain((arc.rstrip("/") + "/").encode("utf-8"), mtime, (0o40755 << 16) | 0x10)
+
+    def add_file(self, path, arc):
+        st = os.stat(path)
+        if st.st_size == 0:  # like 7-Zip and Info-ZIP: an empty file has no content to protect and is stored plain
+            return self._add_plain(arc.encode("utf-8"), st.st_mtime, 0o100644 << 16)
+        z64 = st.st_size >= ZIP64_FILE
+        name = arc.encode("utf-8")
+        dt, dd = _dos_time(st.st_mtime)
+        flags = 0x0001 | 0x0008 | 0x0800        # encrypted, sizes follow the data, UTF-8 name
+        aes_extra = struct.pack("<HHH2sBH", 0x9901, 7, 2, b"AE", 3, 8)  # AE-2, AES-256, real method = deflate
+        extra = (struct.pack("<HHQQ", 1, 16, 0, 0) if z64 else b"") + aes_extra
+        off = self.pos
+        self._w(struct.pack("<IHHHHHIIIHH", 0x04034B50, 51, flags, 99, dt, dd, 0, 0, 0, len(name), len(extra)) + name + extra)
+        salt = secrets.token_bytes(16)
+        dk = hashlib.pbkdf2_hmac("sha1", self.pw, salt, 1000, 66)
+        enc, mac = AesCtr(dk[:32], self.fast), hmac.new(dk[32:64], digestmod="sha1")
+        self._w(salt + dk[64:66])
+        csize, usize = 18, 0
+        comp = zlib.compressobj(6, zlib.DEFLATED, -15)
+        with open(path, "rb") as f:
+            while True:
+                buf = f.read(CHUNK // 4)
+                piece = comp.compress(buf) if buf else comp.flush()
+                usize += len(buf)
+                if piece:
+                    piece = enc.process(piece)
+                    mac.update(piece)
+                    self._w(piece)
+                    csize += len(piece)
+                if not buf:
+                    break
+        self._w(mac.digest()[:10])
+        csize += 10
+        if not z64 and max(csize, usize) >= 0xFFFFFFFF:
+            raise OSError("file grew while it was being packed")
+        self._w(struct.pack("<IIQQ" if z64 else "<IIII", 0x08074B50, 0, csize, usize))
+        self.cd.append((name, flags, 99, dt, dd, csize, usize, off, 0o100644 << 16, True))
+
+    def close(self):
+        start = self.pos
+        for name, flags, method, dt, dd, csize, usize, off, attr, is_file in self.cd:
+            vals, c32, u32, o32 = [], csize, usize, off
+            if usize >= 0xFFFFFFFF:
+                vals.append(usize)
+                u32 = 0xFFFFFFFF
+            if csize >= 0xFFFFFFFF:
+                vals.append(csize)
+                c32 = 0xFFFFFFFF
+            if off >= 0xFFFFFFFF:
+                vals.append(off)
+                o32 = 0xFFFFFFFF
+            extra = struct.pack("<HH%dQ" % len(vals), 1, 8 * len(vals), *vals) if vals else b""
+            if is_file:
+                extra += struct.pack("<HHH2sBH", 0x9901, 7, 2, b"AE", 3, 8)
+            need = 51 if is_file else 20
+            self._w(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, (3 << 8) | 63, need, flags, method, dt, dd, 0,
+                                c32, u32, len(name), len(extra), 0, 0, 0, attr, o32) + name + extra)
+        size, n = self.pos - start, len(self.cd)
+        if n >= 0xFFFF or start >= 0xFFFFFFFF or size >= 0xFFFFFFFF:
+            z_at = self.pos
+            self._w(struct.pack("<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, n, n, size, start))
+            self._w(struct.pack("<IIQI", 0x07064B50, 0, z_at, 1))
+        self._w(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, min(n, 0xFFFF), min(n, 0xFFFF),
+                            min(size, 0xFFFFFFFF), min(start, 0xFFFFFFFF), 0))
+
+
 class ChunkedWriter:
     """File-like object that sends everything as HTTP chunked encoding (for streamed ZIPs)."""
 
@@ -1206,7 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
                                ROWS="".join(rows), RO="ro" if CFG.get("read_only") else ""), HTML)
 
     # -- ZIP download (streamed, chunked)
-    def zip_download(self, full, names):
+    def zip_download(self, full, names, password=None):
         root = CFG["root"]
         entries = []
 
@@ -1238,6 +1457,8 @@ class Handler(BaseHTTPRequestHandler):
             top = os.path.basename(full)  # for the root this is the hatch-YYYYMMDD-HHMMSS folder name
             add(full, top)
             zipname = top + ".zip"
+        if password is not None:
+            zipname = zipname[:-4] + "-encrypted.zip"
 
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
@@ -1249,21 +1470,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         out = ChunkedWriter(self.wfile)
         try:
-            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            if password is None:
+                with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                    for p, arc, isdir in entries:
+                        if isdir:
+                            zi = zipfile.ZipInfo(arc + "/")
+                            zi.external_attr = (0o40755 << 16) | 0x10
+                            zf.writestr(zi, b"")
+                        else:
+                            zf.write(p, arc)
+            else:
+                zw = AesZipWriter(out, password)
                 for p, arc, isdir in entries:
                     if isdir:
-                        zi = zipfile.ZipInfo(arc + "/")
-                        zi.external_attr = (0o40755 << 16) | 0x10
-                        zf.writestr(zi, b"")
+                        zw.add_dir(arc, os.stat(p).st_mtime)
                     else:
-                        zf.write(p, arc)
+                        zw.add_file(p, arc)
+                zw.close()
             out.finish()
         except Exception as e:
             self.close_connection = True  # no terminating chunk: the client sees an incomplete download
             audit(self.client_address[0], "ZIP_FAIL", f"{self.rel(full)} {e}")
             return
         files = sum(1 for _, _, d in entries if not d)
-        audit(self.client_address[0], "ZIP", f"{self.rel(full)} ({files} files)")
+        audit(self.client_address[0], "ZIP_AES" if password is not None else "ZIP", f"{self.rel(full)} ({files} files)")
         transfer_done()
 
     # -- PUT (upload)
@@ -1350,9 +1580,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.token_login()
         if path == "/__logout":
             return self.logout()
+        if path == "/__zip":
+            return self.zip_post()
         if path.startswith("/__api/"):
             return self.api(path[len("/__api/"):])
         self.reply(405, "Not allowed.\n", close=True)
+
+    def zip_post(self):
+        """Encrypted ZIP download. POST (form) so the ZIP password never appears in a URL or in history."""
+        if not self.authed():
+            return
+        # Defence in depth against cross-site form posts (the session cookie is SameSite=Strict anyway). Browsers send
+        # "Origin: null" for same-origin form posts because of our Referrer-Policy: no-referrer, so that is allowed.
+        site, origin = self.headers.get("Sec-Fetch-Site"), self.headers.get("Origin")
+        if (site and site not in ("same-origin", "none")) or \
+                (origin and origin not in ("null", "https://" + (self.headers.get("Host") or ""))):
+            return self.reply(403, "Forbidden.\n", close=True)
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = 0
+        if not 0 < length <= 262144:
+            return self.reply(400, "Bad request.\n", close=True)
+        data = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+        pw = data.get("password", [""])[0]
+        if not ZIP_PW_MIN <= len(pw) <= ZIP_PW_MAX:
+            return self.reply(400, f"The ZIP password needs {ZIP_PW_MIN} to {ZIP_PW_MAX} characters.\n", close=True)
+        full = self.resolve_path(data.get("path", ["/"])[0])
+        if full is None or not os.path.isdir(full):
+            return self.reply(404, "Folder not found.\n", close=True)
+        self.zip_download(full, [n for n in data.get("zip", []) if n], pw)
 
     def api(self, action):
         if not self.authed():
